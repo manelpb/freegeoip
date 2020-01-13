@@ -27,12 +27,10 @@ import (
 	"github.com/go-web/httprl"
 	"github.com/go-web/httprl/memcacherl"
 	"github.com/go-web/httprl/redisrl"
+	"github.com/manelpb/freegeoip"
 	newrelic "github.com/newrelic/go-agent"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/cors"
 	"golang.org/x/text/language"
-
-	"github.com/apilayer/freegeoip"
 )
 
 type apiHandler struct {
@@ -40,11 +38,21 @@ type apiHandler struct {
 	conf  *Config
 	cors  *cors.Cors
 	nrapp newrelic.Application
+	redis *redis.Client
 }
 
 // NewHandler creates an http handler for the freegeoip server that
 // can be embedded in other servers.
 func NewHandler(c *Config) (http.Handler, error) {
+	// redisAddr := "192.168.1.140:6379 db=0"
+
+	// addrs := strings.Split(redisAddr, ",")
+	// rc, err := redis.NewClient(addrs...)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// rc.SetTimeout(c.RedisTimeout)
+
 	db, err := openDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
@@ -54,6 +62,7 @@ func NewHandler(c *Config) (http.Handler, error) {
 		AllowedMethods:   []string{"GET"},
 		AllowCredentials: true,
 	})
+	// f := &apiHandler{db: db, conf: c, cors: cf, redis: rc}
 	f := &apiHandler{db: db, conf: c, cors: cf}
 	mc := httpmux.DefaultConfig
 	if err := f.config(&mc); err != nil {
@@ -98,12 +107,13 @@ func (f *apiHandler) config(mc *httpmux.Config) error {
 	return nil
 }
 
-func newPublicDirHandler(path string) http.HandlerFunc {
+func newPublicDirHandler(path string) http.Handler {
 	handler := http.NotFoundHandler()
 	if path != "" {
 		handler = http.FileServer(http.Dir(path))
 	}
-	return prometheus.InstrumentHandler("frontend", handler)
+
+	return handler
 }
 
 func hstsMiddleware(policy string) httpmux.MiddlewareFunc {
@@ -155,12 +165,7 @@ func clientMetricsMiddleware(db *freegeoip.DB) httpmux.MiddlewareFunc {
 type writerFunc func(w http.ResponseWriter, r *http.Request, d *responseRecord)
 
 func (f *apiHandler) register(name string, writer writerFunc) http.HandlerFunc {
-	var h http.Handler
-	if f.nrapp == nil {
-		h = prometheus.InstrumentHandler(name, f.iplookup(writer))
-	} else {
-		h = prometheus.InstrumentHandler(newrelic.WrapHandle(f.nrapp, name, f.iplookup(writer)))
-	}
+	_, h := newrelic.WrapHandle(f.nrapp, name, f.iplookup(writer))
 
 	return f.cors.Handler(h).ServeHTTP
 }
@@ -171,6 +176,16 @@ func (f *apiHandler) iplookup(writer writerFunc) http.HandlerFunc {
 		if len(host) > 0 && host[0] == '/' {
 			host = host[1:]
 		}
+
+		// v, err := f.redis.Get(host)
+
+		// if v != "" {
+		// 	w.Header().Set("X-Database-Date", f.db.Date().Format(http.TimeFormat))
+		// 	resp := recordFromString(v)
+		// 	writer(w, r, resp)
+		// 	return
+		// }
+
 		if host == "" {
 			host, _, _ = net.SplitHostPort(r.RemoteAddr)
 			if host == "" {
@@ -183,13 +198,24 @@ func (f *apiHandler) iplookup(writer writerFunc) http.HandlerFunc {
 			return
 		}
 		ip, q := ips[rand.Intn(len(ips))], &geoipQuery{}
+
+		// fmt.Println(ip)
+
 		err = f.db.Lookup(ip, &q.DefaultQuery)
 		if err != nil {
+			log.Println(err)
 			http.Error(w, "Try again later.", http.StatusServiceUnavailable)
 			return
 		}
+
 		w.Header().Set("X-Database-Date", f.db.Date().Format(http.TimeFormat))
 		resp := q.Record(ip, r.Header.Get("Accept-Language"))
+
+		fmt.Println(resp.String())
+
+		// store in redis
+		// f.redis.Set(host, resp.String())
+
 		writer(w, r, resp)
 	}
 }
@@ -240,11 +266,34 @@ func (q *geoipQuery) Record(ip net.IP, lang string) *responseRecord {
 		Latitude:    roundFloat(q.Location.Latitude, .5, 4),
 		Longitude:   roundFloat(q.Location.Longitude, .5, 4),
 		MetroCode:   q.Location.MetroCode,
+		Cached:      false,
 	}
 	if len(q.Region) > 0 {
 		r.RegionCode = q.Region[0].ISOCode
 		r.RegionName = q.Region[0].Names[lang]
 	}
+	return r
+}
+
+func recordFromString(record string) *responseRecord {
+	s := strings.Split(record, ",")
+
+	// metroCode, _ := strconv.ParseUint(s[8], 10, 64)
+
+	r := &responseRecord{
+		IP:          s[0],
+		CountryCode: s[1],
+		CountryName: s[2],
+		RegionCode:  s[3],
+		RegionName:  s[4],
+		City:        s[5],
+		ZipCode:     s[6],
+		TimeZone:    s[7],
+		// Latitude:    uint(s[8]),
+		// Longitude:   uint(s[9]),
+		Cached: true,
+	}
+
 	return r
 }
 
@@ -297,6 +346,7 @@ type responseRecord struct {
 	Latitude    float64  `json:"latitude"`
 	Longitude   float64  `json:"longitude"`
 	MetroCode   uint     `json:"metro_code"`
+	Cached      bool     `json:"cached"`
 }
 
 func (rr *responseRecord) String() string {
