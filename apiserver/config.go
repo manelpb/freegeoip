@@ -13,7 +13,7 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 
-	"github.com/apilayer/freegeoip"
+	"github.com/manelpb/freegeoip"
 )
 
 // Config is the configuration of the freegeoip server.
@@ -66,7 +66,7 @@ func NewConfig() *Config {
 	return &Config{
 		FastOpen:            false,
 		Naggle:              false,
-		ServerAddr:          ":8080",
+		ServerAddr:          ":8081",
 		HTTP2:               true,
 		HSTS:                "",
 		TLSCertFile:         "cert.pem",

@@ -5,6 +5,7 @@
 package freegeoip
 
 import (
+	"archive/tar"
 	"compress/gzip"
 	"crypto/md5"
 	"encoding/hex"
@@ -12,12 +13,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +39,7 @@ var (
 
 	// MaxMindDB is the URL of the free MaxMind GeoLite2 database.
 	MaxMindDB = "http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz"
+	// MaxMindDB = "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=gz&license_key="
 )
 
 // DB is the IP geolocation database.
@@ -186,6 +190,7 @@ func (db *DB) openFile() error {
 	if err != nil {
 		return err
 	}
+
 	db.setReader(reader, stat.ModTime(), checksum)
 	return nil
 }
@@ -196,18 +201,42 @@ func (db *DB) newReader(dbfile string) (*maxminddb.Reader, string, error) {
 		return nil, "", err
 	}
 	defer f.Close()
+
 	gzf, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, "", err
 	}
+
 	defer gzf.Close()
-	b, err := ioutil.ReadAll(gzf)
-	if err != nil {
-		return nil, "", err
+
+	tarReader := tar.NewReader(gzf)
+	for true {
+		header, err := tarReader.Next()
+
+		if err == io.EOF {
+			break
+		}
+
+		log.Println(header.Name)
+
+		if err != nil {
+			log.Fatalf("ExtractTarGz: Next() failed: %s", err.Error())
+		}
+
+		if strings.Contains(header.Name, "GeoLite2-City.mmdb") {
+			b, err := ioutil.ReadAll(tarReader)
+
+			if err != nil {
+				return nil, "", err
+			}
+
+			checksum := fmt.Sprintf("%x", md5.Sum(b))
+			mmdb, err := maxminddb.FromBytes(b)
+			return mmdb, checksum, err
+		}
 	}
-	checksum := fmt.Sprintf("%x", md5.Sum(b))
-	mmdb, err := maxminddb.FromBytes(b)
-	return mmdb, checksum, err
+
+	return nil, "", err
 }
 
 func (db *DB) setReader(reader *maxminddb.Reader, modtime time.Time, checksum string) {
@@ -302,17 +331,21 @@ func (db *DB) download(url string) (tmpfile string, err error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	tmpfile = filepath.Join(os.TempDir(),
 		fmt.Sprintf("_freegeoip.%d.db.gz", time.Now().UnixNano()))
 	f, err := os.Create(tmpfile)
 	if err != nil {
 		return "", err
 	}
+
 	defer f.Close()
 	_, err = io.Copy(f, resp.Body)
+
 	if err != nil {
 		return "", err
 	}
+
 	return tmpfile, nil
 }
 
